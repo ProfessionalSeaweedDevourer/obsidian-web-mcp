@@ -56,3 +56,46 @@ def test_merge_aborts_on_malformed_new_frontmatter(vault_dir):
 
     assert (config.VAULT_PATH / path).read_text() == original  # left untouched
     assert "error" in result
+
+
+def test_merge_overrides_existing_key_value(vault_dir):
+    """A new value for an existing key wins, while other keys keep their formatting."""
+    path = "fmt.md"
+    (config.VAULT_PATH / path).write_text(
+        "---\nstatus: 'active'\ntags:\n  - alpha\n  - beta\n---\nbody\n"
+    )
+
+    vault_write(path, "---\nstatus: archived\n---\nbody\n", merge_frontmatter=True)
+
+    result = (config.VAULT_PATH / path).read_text()
+    assert "status: 'archived'" in result   # value overridden, quote slot kept
+    assert "status: 'active'" not in result  # old value gone
+    assert "  - alpha" in result             # untouched key keeps block style
+
+
+def test_merge_bodyless_new_content_keeps_frontmatter(vault_dir):
+    """New content with no frontmatter preserves existing frontmatter, replaces body."""
+    path = "fmt.md"
+    (config.VAULT_PATH / path).write_text(
+        "---\ntitle: 'kept'\npinned: yes\n---\nold body\n"
+    )
+
+    vault_write(path, "brand new body only\n", merge_frontmatter=True)
+
+    result = (config.VAULT_PATH / path).read_text()
+    assert "title: 'kept'" in result      # existing frontmatter preserved
+    assert "pinned: yes" in result
+    assert "brand new body only" in result  # body replaced
+    assert "old body" not in result
+
+
+def test_no_merge_writes_content_byte_identical(vault_dir):
+    """With merge_frontmatter=False the content is written verbatim (no YAML rewrite)."""
+    path = "fmt.md"
+    (config.VAULT_PATH / path).write_text("---\nold: 1\n---\nold body\n")
+
+    # Forms PyYAML would normalize (yes->true, flow list, quotes) must survive as-is.
+    content = "---\nstatus: yes\ntags: [a, b]\nq: 'x'\n---\nbody\n"
+    vault_write(path, content, merge_frontmatter=False)
+
+    assert (config.VAULT_PATH / path).read_text() == content

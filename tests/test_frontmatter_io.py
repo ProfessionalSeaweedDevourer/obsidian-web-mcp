@@ -29,7 +29,7 @@ def test_loads_empty_frontmatter_block():
     """A file with empty frontmatter (---\\n---\\n) returns empty metadata."""
     content = "---\n---\nBody after empty frontmatter.\n"
     metadata, body = frontmatter_io.loads(content)
-    assert metadata == {} or metadata is None or len(metadata) == 0
+    assert metadata == {}
     assert "Body after empty frontmatter." in body
 
 
@@ -123,6 +123,15 @@ def test_update_field_preserves_other_formatting():
     assert "- alpha" in out
     assert "- beta" in out
     assert "priority: 2" in out
+
+
+def test_update_existing_quoted_value_keeps_quote_style():
+    """Overwriting an existing key's value retains that key's original quote style."""
+    metadata, body = frontmatter_io.loads("---\nstatus: 'active'\npriority: 1\n---\nx\n")
+    metadata["status"] = "draft"
+    out = frontmatter_io.dumps(metadata, body)
+    assert "status: 'draft'" in out   # value changed, single-quote slot kept
+    assert "priority: 1" in out
 
 
 def test_dumps_no_frontmatter_writes_body_unchanged():
