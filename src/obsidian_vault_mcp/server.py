@@ -127,9 +127,11 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
 @mcp.tool(
     name="vault_edit",
     description=(
-        "Patch an existing vault file with exact text replacements. Use this for token-efficient partial edits "
-        "when only small fragments change; supports dry-run diff previews and avoids resending the full file. "
-        "Each edit is an object {old_text, new_text}; old_text must match exactly once."
+        "Patch an existing vault file with token-efficient partial edits, avoiding resending the full file; "
+        "supports dry-run diff previews. Each edit either replaces text {old_text, new_text} (old_text must match "
+        "exactly once; set match='normalized' to ignore whitespace/EOL differences) or inserts at an anchor "
+        "{insert_after|insert_before, text} (anchor must match exactly once). Use new_text='' to delete, and a "
+        "delete + insert pair to move a block without resending its body."
     ),
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False},
 )

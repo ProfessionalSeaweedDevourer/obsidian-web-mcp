@@ -220,10 +220,11 @@ def test_patch_style_inputs_normalize_str_replace_aliases():
     )
 
     dumped = edit_input.edits[0].model_dump()
-    assert dumped == {
-        "old_text": "  keep me\n",
-        "new_text": "\n  keep replacement  ",
-    }
+    assert dumped["old_text"] == "  keep me\n"
+    assert dumped["new_text"] == "\n  keep replacement  "
+    # The alias path produces a replace edit, never an insert.
+    assert dumped["insert_after"] is None
+    assert dumped["insert_before"] is None
 
 
 def test_vault_search_finds_text(vault_dir):

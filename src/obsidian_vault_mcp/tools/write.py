@@ -2,6 +2,7 @@
 
 import difflib
 import logging
+import re
 
 import frontmatter
 
@@ -107,48 +108,139 @@ def _find_near_miss(content: str, old_text: str) -> dict | None:
     }
 
 
+def _normalized_pattern(old_text: str) -> "re.Pattern | None":
+    """Compile old_text into a whitespace-tolerant regex, or None if it is blank.
+
+    Splitting on whitespace runs and rejoining the escaped tokens with ``\\s+``
+    makes the match ignore how much whitespace (spaces, tabs, line breaks)
+    separates the words and any leading/trailing whitespace, while keeping the
+    word sequence exact. The tokens are literals joined by a single quantifier,
+    so there is no nested repetition to backtrack on.
+    """
+    tokens = old_text.split()
+    if not tokens:
+        return None
+    return re.compile(r"\s+".join(re.escape(token) for token in tokens))
+
+
+def _malformed_edit(kind: str, why: str) -> dict:
+    """Build the resolve result for an edit that is itself invalid."""
+    return {"kind": kind, "malformed": why, "count": 0, "near_miss": None, "result": None}
+
+
+def _resolve_edit(content: str, edit: dict) -> dict:
+    """Resolve one normalized edit against ``content`` without mutating it.
+
+    Returns a dict describing the outcome so both the dry-run and apply paths
+    share one matching implementation:
+
+    - ``kind``: ``"replace"`` or ``"insert"`` (drives the error wording).
+    - ``malformed``: a message when the edit itself is invalid (empty old_text,
+      insert without text/anchor, whitespace-only normalized old_text); else None.
+    - ``count``: occurrences of the matched text/anchor in ``content``.
+    - ``near_miss``: closest-line hint, present only when ``count == 0``.
+    - ``result``: the content after applying this edit, present only when
+      ``count == 1``. It is computed from the ``content`` passed here.
+    """
+    insert_after = edit.get("insert_after")
+    insert_before = edit.get("insert_before")
+
+    if insert_after is not None or insert_before is not None:
+        anchor = insert_after if insert_after is not None else insert_before
+        text = edit.get("text")
+        if text is None:
+            return _malformed_edit("insert", "is an insert without text")
+        if not anchor:
+            return _malformed_edit("insert", "has an empty insert anchor")
+
+        count = content.count(anchor)
+        result = None
+        if count == 1:
+            cut = content.index(anchor)
+            if insert_after is not None:
+                cut += len(anchor)
+            result = content[:cut] + text + content[cut:]
+        return {
+            "kind": "insert", "malformed": None, "count": count,
+            "near_miss": _find_near_miss(content, anchor) if count == 0 else None,
+            "result": result,
+        }
+
+    # Replace operation.
+    old_text = edit.get("old_text", "")
+    new_text = edit.get("new_text", "")
+    if not old_text:
+        # An empty old_text would make str.count() report a phantom match for
+        # every position; reject it as the malformed edit it is.
+        return _malformed_edit("replace", "has no old_text to match")
+
+    if edit.get("match") == "normalized":
+        pattern = _normalized_pattern(old_text)
+        if pattern is None:
+            return _malformed_edit("replace", "has a whitespace-only old_text")
+        matches = list(pattern.finditer(content))
+        count = len(matches)
+        result = None
+        if count == 1:
+            start, end = matches[0].span()
+            result = content[:start] + new_text + content[end:]
+        return {
+            "kind": "replace", "malformed": None, "count": count,
+            "near_miss": _find_near_miss(content, old_text) if count == 0 else None,
+            "result": result,
+        }
+
+    count = content.count(old_text)
+    return {
+        "kind": "replace", "malformed": None, "count": count,
+        "near_miss": _find_near_miss(content, old_text) if count == 0 else None,
+        "result": content.replace(old_text, new_text, 1) if count == 1 else None,
+    }
+
+
 def _dry_run_report(path: str, original_content: str, normalized_edits: list[dict]) -> str:
-    """Preview edits without writing, counting each old_text against the original.
+    """Preview edits without writing, reporting each edit's match outcome.
 
     Unlike the apply path this does not fail fast: every edit's match count
-    (0, 1, or many) is reported so one response surfaces all mismatches. When
-    every edit matches exactly once the sequential diff preview is included too.
+    (0, 1, or many) is reported so one response surfaces all mismatches. Counts
+    are measured independently against the original document.
 
-    Counts are measured independently against the original document, so for
-    chained edits (one edit's new_text feeds another's old_text) this preview
-    will not predict the sequential apply outcome; the apply path's fail-fast
-    is the safety net there.
+    When every edit matches exactly once, a diff preview is produced by
+    applying the edits sequentially against an evolving copy. For chained edits
+    (one edit's output feeds another's match) that sequential pass can still
+    fail even though the per-edit counts looked unique; in that case the diff is
+    omitted and the apply path's fail-fast remains the safety net.
     """
     match_counts = []
     all_unique = True
     for index, edit in enumerate(normalized_edits):
-        old_text = edit.get("old_text", "")
+        info = _resolve_edit(original_content, edit)
         entry = {"index": index}
-        if not old_text:
+        if info["malformed"]:
             entry["count"] = 0
-            entry["error"] = "no old_text to match"
+            entry["error"] = info["malformed"]
             all_unique = False
             match_counts.append(entry)
             continue
-        count = original_content.count(old_text)
-        entry["count"] = count
-        if count == 0:
-            near_miss = _find_near_miss(original_content, old_text)
-            if near_miss:
-                entry["near_miss"] = near_miss
-        if count != 1:
+        entry["count"] = info["count"]
+        if info["count"] == 0 and info["near_miss"]:
+            entry["near_miss"] = info["near_miss"]
+        if info["count"] != 1:
             all_unique = False
         match_counts.append(entry)
 
+    diff = ""
+    size = len(original_content.encode("utf-8"))
     if all_unique:
         preview = original_content
         for edit in normalized_edits:
-            preview = preview.replace(edit.get("old_text", ""), edit.get("new_text", ""), 1)
+            step = _resolve_edit(preview, edit)
+            if step["count"] != 1 or step["malformed"] or step["result"] is None:
+                preview = original_content
+                break
+            preview = step["result"]
         diff = _unified_diff(path, original_content, preview)
         size = len(preview.encode("utf-8"))
-    else:
-        diff = ""
-        size = len(original_content.encode("utf-8"))
 
     return dumps({
         "path": path,
@@ -187,14 +279,11 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
             return _dry_run_report(path, original_content, normalized_edits)
 
         for index, normalized_edit in enumerate(normalized_edits):
-            old_text = normalized_edit.get("old_text", "")
-            new_text = normalized_edit.get("new_text", "")
+            info = _resolve_edit(content, normalized_edit)
 
-            if not old_text:
-                # An empty old_text would make content.count() report a phantom
-                # match for every position; reject it as the malformed edit it is.
+            if info["malformed"]:
                 return dumps({
-                    "error": f"Edit {index} has no old_text to match",
+                    "error": f"Edit {index} {info['malformed']}",
                     "path": path,
                     "changed": False,
                     "dry_run": dry_run,
@@ -203,13 +292,12 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
                     "size": len(original_content.encode("utf-8")),
                 })
 
-            count = content.count(old_text)
-
-            if count != 1:
+            if info["count"] != 1:
+                target = "anchor" if info["kind"] == "insert" else "old_text"
                 payload = {
                     "error": (
-                        f"Edit {index} old_text must match exactly once; "
-                        f"found {count} matches"
+                        f"Edit {index} {target} must match exactly once; "
+                        f"found {info['count']} matches"
                     ),
                     "path": path,
                     "changed": False,
@@ -218,13 +306,11 @@ def vault_edit(path: str, edits: list[dict], dry_run: bool = False) -> str:
                     "edits_applied": 0,
                     "size": len(original_content.encode("utf-8")),
                 }
-                if count == 0:
-                    near_miss = _find_near_miss(content, old_text)
-                    if near_miss:
-                        payload["near_miss"] = near_miss
+                if info["count"] == 0 and info["near_miss"]:
+                    payload["near_miss"] = info["near_miss"]
                 return dumps(payload)
 
-            content = content.replace(old_text, new_text, 1)
+            content = info["result"]
 
         diff = _unified_diff(path, original_content, content)
         size = len(content.encode("utf-8"))

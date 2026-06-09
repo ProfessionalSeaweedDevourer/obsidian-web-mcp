@@ -85,7 +85,13 @@ def normalize_edit_aliases(data: Any) -> Any:
 
 
 class VaultEditOperationInput(BaseModel):
-    """Replace one exact text fragment inside a vault file."""
+    """One edit: replace an exact fragment, or insert text at an anchor.
+
+    A *replace* edit supplies old_text (+ new_text); set match='normalized' to
+    ignore whitespace/EOL differences between old_text and the file. An *insert*
+    edit supplies insert_after or insert_before (a short anchor) plus text, so a
+    block can be inserted or moved without duplicating the surrounding body.
+    """
 
     model_config = ConfigDict(str_strip_whitespace=False, extra="forbid")
 
@@ -94,17 +100,63 @@ class VaultEditOperationInput(BaseModel):
     def normalize_str_replace_aliases(cls, data):
         return normalize_edit_aliases(data)
 
-    old_text: str = Field(
-        ...,
+    old_text: str | None = Field(
+        default=None,
         description="Exact existing text fragment to replace; must appear exactly once",
-        min_length=1,
         max_length=MAX_CONTENT_SIZE,
     )
-    new_text: str = Field(
-        ...,
-        description="Replacement text for old_text",
+    new_text: str | None = Field(
+        default=None,
+        description="Replacement text for old_text (use \"\" to delete the matched text)",
         max_length=MAX_CONTENT_SIZE,
     )
+    match: Literal["exact", "normalized"] = Field(
+        default="exact",
+        description="old_text matching: 'exact' byte-for-byte, or 'normalized' to ignore whitespace/EOL differences",
+    )
+    insert_after: str | None = Field(
+        default=None,
+        description="Anchor text to insert after; must appear exactly once",
+        max_length=MAX_CONTENT_SIZE,
+    )
+    insert_before: str | None = Field(
+        default=None,
+        description="Anchor text to insert before; must appear exactly once",
+        max_length=MAX_CONTENT_SIZE,
+    )
+    text: str | None = Field(
+        default=None,
+        description="Text to insert at the anchor (required for insert_after/insert_before)",
+        max_length=MAX_CONTENT_SIZE,
+    )
+
+    @model_validator(mode="after")
+    def _validate_operation_shape(self):
+        is_insert = self.insert_after is not None or self.insert_before is not None
+        is_replace = self.old_text is not None or self.new_text is not None
+
+        if is_insert and is_replace:
+            raise ValueError(
+                "an edit is either a replace (old_text/new_text) or an insert "
+                "(insert_after/insert_before), not both"
+            )
+        if self.insert_after is not None and self.insert_before is not None:
+            raise ValueError("use only one of 'insert_after' or 'insert_before'")
+
+        if is_insert:
+            anchor = self.insert_after if self.insert_after is not None else self.insert_before
+            if not anchor:
+                raise ValueError("insert anchor must be non-empty")
+            if self.text is None:
+                raise ValueError("insert_after/insert_before requires 'text'")
+            return self
+
+        # Replace operation.
+        if not self.old_text:
+            raise ValueError("a replace edit requires a non-empty 'old_text'")
+        if self.new_text is None:
+            raise ValueError("a replace edit requires 'new_text'")
+        return self
 
 
 class VaultEditInput(BaseModel):
