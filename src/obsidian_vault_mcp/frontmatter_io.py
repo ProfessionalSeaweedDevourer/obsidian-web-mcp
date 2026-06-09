@@ -10,13 +10,10 @@ update.
 from __future__ import annotations
 
 import io
-import logging
 import re
+import sys
 
 from ruamel.yaml import YAML
-from ruamel.yaml.error import YAMLError
-
-logger = logging.getLogger(__name__)
 
 _FRONTMATTER_RE = re.compile(
     r"\A---[ \t]*\r?\n(.*?)(?:\r?\n)?---[ \t]*\r?\n?(.*)\Z",
@@ -24,18 +21,34 @@ _FRONTMATTER_RE = re.compile(
 )
 
 
-_YAML = YAML(typ="rt")
-_YAML.preserve_quotes = True
-_YAML.width = 4096
-_YAML.indent(mapping=2, sequence=4, offset=2)
+def _make_yaml() -> YAML:
+    """Build a fresh round-trip YAML handler.
+
+    A handler is created per call rather than shared at module scope: ruamel's
+    YAML instances hold mutable parser/emitter state and are not thread-safe,
+    so a shared instance corrupts output when sync MCP tools run concurrently
+    in the server's threadpool.
+    """
+    yaml = YAML(typ="rt")
+    yaml.preserve_quotes = True
+    # Disable line wrapping entirely: any finite width re-folds long scalars
+    # (URLs, descriptions) on dump, which is exactly the formatting churn this
+    # module exists to avoid. sys.maxsize means "never auto-wrap".
+    yaml.width = sys.maxsize
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    return yaml
 
 
 def loads(content: str) -> tuple[dict, str]:
     """Parse a markdown file into (metadata, body).
 
     When frontmatter is present, metadata is a ruamel.yaml CommentedMap that
-    retains the original formatting for round-trip dumping. When absent,
-    returns ({}, content).
+    retains the original formatting for round-trip dumping. When no frontmatter
+    delimiters are present (or the block is empty), returns ({}, content).
+
+    Raises ruamel.yaml.error.YAMLError when delimiters ARE present but the YAML
+    inside is malformed. Callers must not treat that as "no frontmatter":
+    swallowing it would silently drop the user's existing keys on a merge.
     """
     match = _FRONTMATTER_RE.match(content)
     if match is None:
@@ -51,11 +64,7 @@ def loads(content: str) -> tuple[dict, str]:
     if not raw_yaml.endswith("\n"):
         raw_yaml += "\n"
 
-    try:
-        metadata = _YAML.load(raw_yaml)
-    except YAMLError as e:
-        logger.warning("YAML frontmatter parse failed: %s", e)
-        return {}, content
+    metadata = _make_yaml().load(raw_yaml)
 
     if metadata is None:
         return {}, body
@@ -66,11 +75,20 @@ def loads(content: str) -> tuple[dict, str]:
 def dumps(metadata: dict | None, body: str) -> str:
     """Serialize (metadata, body) back to a markdown file.
 
-    Empty metadata writes the body unchanged (no delimiters).
+    Empty metadata writes the body unchanged (no delimiters). The YAML block
+    and its delimiters adopt the body's line-ending style (CRLF if the body
+    uses CRLF, else LF) so the result never mixes endings: ruamel always emits
+    LF, which would otherwise leave a CRLF body with an LF frontmatter block.
     """
     if not metadata:
         return body
 
     buf = io.StringIO()
-    _YAML.dump(metadata, buf)
-    return f"---\n{buf.getvalue()}---\n{body}"
+    _make_yaml().dump(metadata, buf)
+    yaml_text = buf.getvalue()
+
+    newline = "\r\n" if "\r\n" in body else "\n"
+    if newline != "\n":
+        yaml_text = yaml_text.replace("\n", newline)
+
+    return f"---{newline}{yaml_text}---{newline}{body}"

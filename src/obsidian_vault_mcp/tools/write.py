@@ -5,6 +5,7 @@ import json
 import logging
 
 import frontmatter
+from ruamel.yaml.error import YAMLError
 
 from .. import frontmatter_io
 from ..vault import resolve_vault_path, read_file, write_file_atomic
@@ -20,8 +21,24 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
         if merge_frontmatter:
             try:
                 existing_content, _ = read_file(path)
-                existing_meta, _ = frontmatter_io.loads(existing_content)
-                new_meta, new_body = frontmatter_io.loads(content)
+            except FileNotFoundError:
+                existing_content = None
+
+            if existing_content is not None:
+                try:
+                    existing_meta, _ = frontmatter_io.loads(existing_content)
+                    new_meta, new_body = frontmatter_io.loads(content)
+                except YAMLError as e:
+                    # Refuse to merge into/over unparseable frontmatter: writing
+                    # would silently drop the existing keys (malformed existing)
+                    # or emit a nested '---' block (malformed new). Leave the
+                    # file untouched and surface the error to the caller.
+                    logger.warning(f"Frontmatter merge aborted for {path}: {e}")
+                    return json.dumps({
+                        "error": f"Frontmatter merge aborted: malformed YAML frontmatter ({e})",
+                        "path": path,
+                        "written": False,
+                    })
 
                 # Mutate existing in place: untouched keys keep their original
                 # formatting (quote style, comments, key order); new keys are
@@ -30,10 +47,6 @@ def vault_write(path: str, content: str, create_dirs: bool = True, merge_frontma
                     existing_meta[key] = value
 
                 content = frontmatter_io.dumps(existing_meta, new_body)
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                logger.warning(f"Frontmatter merge failed for {path}, writing as-is: {e}")
 
         is_new, size = write_file_atomic(path, content, create_dirs=create_dirs)
 
